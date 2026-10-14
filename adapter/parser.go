@@ -41,6 +41,13 @@ func ParseProxy(mapping map[string]any, options ...ProxyOption) (C.Proxy, error)
 			break
 		}
 		proxy, err = outbound.NewShadowSocksR(*ssrOption)
+	case "macc":
+		maccOption := &outbound.MaccOption{BasicOption: basicOption}
+		err = decoder.Decode(mapping, maccOption)
+		if err != nil {
+			break
+		}
+		proxy, err = outbound.NewMacc(*maccOption)
 	case "socks5":
 		socksOption := &outbound.Socks5Option{BasicOption: basicOption}
 		err = decoder.Decode(mapping, socksOption)
