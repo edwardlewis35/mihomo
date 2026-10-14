@@ -19,9 +19,13 @@ package outbound
 //	                                      encrypted conn (maccPacketConn.WriteTo)
 //	[EVIDENCED] capabilities              SupportUDP, SupportUOT, IsL3Protocol
 //
-//	[UNKNOWN]   exact semantics of deriveMaccKey arg1/arg2 (assumed
-//	              password + empty context; adjust when Ghidra pseudocode lands)
-//	[UNKNOWN]   CBC IV policy for the descriptor (assumed first-16-bytes prefix IV)
+//	[EVIDENCED] deriveMaccKey inputs: candidate key strings =
+//	              [extractMaccDomain(secondary), secondary], arg2 = secondary
+//	              (option field @+0xd0, inferred Password) [INFERRED mapping]
+//	[EVIDENCED] CBC IV policy: hand-rolled CBC decrypt loop (per-16B Decrypt +
+//	              xor chain, len>=32 guard) => first 16 bytes are the IV
+//	[EVIDENCED] UDP framing: WriteTo trims the 3-byte RSV/FRAG prefix
+//	              (lea rdi,[rcx-0x3]; lea rcx,[rbx-0x3] @MaccCore 0x1143fca)
 //	[UNKNOWN]   `prefix` field semantics (kept verbatim, unused)
 //	[UNKNOWN]   whether maccPacketConn strips the 3-byte socks5 RSV/FRAG header
 //	              like ssr does (kept full packet here; toggle with trim flag)
@@ -254,9 +258,8 @@ type maccPacketConn struct {
 
 // WriteTo mirrors maccPacketConn.WriteTo@0x140d11200:
 // socks5.ParseAddrToSocksAddr + socks5.EncodeUDPPacket [EVIDENCED].
-// The 3-byte RSV/FRAG prefix is trimmed to stay symmetric with the ssr stack
-// the original reuses; whether the true server expects the trimmed form is
-// [UNKNOWN] pending Ghidra pseudocode — flip trimRSV to test both.
+// The 3-byte RSV/FRAG prefix IS trimmed, exactly like ssr — confirmed in the
+// MaccCore disassembly (bounds check cmp rbx,0x3 + pointer/len -3 adjust).
 func (mpc *maccPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	packet, err := socks5.EncodeUDPPacket(socks5.ParseAddrToSocksAddr(addr), b)
 	if err != nil {
@@ -272,7 +275,7 @@ func (mpc *maccPacketConn) WriteTo(b []byte, addr net.Addr) (n int, err error) {
 	return len(b), nil
 }
 
-var trimRSV = true // ssr-compatible framing; A/B against raw socks5 UDP when server-side evidence lands
+var trimRSV = true // [EVIDENCED] original trims RSV/FRAG: lea rdi,[rcx-0x3]; lea rcx,[rbx-0x3]
 
 func (mpc *maccPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 	n, _, e := mpc.EnhancePacketConn.ReadFrom(b)
@@ -295,7 +298,9 @@ func (mpc *maccPacketConn) ReadFrom(b []byte) (int, net.Addr, error) {
 
 // deriveMaccKey mirrors deriveMaccKey@0x140d105e0:
 // SHA-256(arg1 || arg2 || MaccSalt), 32-byte output. [EVIDENCED structure]
-// arg1/arg2 semantics are [UNKNOWN]; callers pass (password, "").
+// arg1 = candidate key string (decoded ciphertext bytes or descriptor segment),
+// arg2 = secondary option field (inferred: password). [EVIDENCED: candidate
+// loop @MaccCore 0x1142a65..0x1142ab5 walks a deduped []string of candidates]
 func deriveMaccKey(arg1, arg2 string) []byte {
 	h := sha256.New()
 	h.Write([]byte(arg1))
@@ -304,20 +309,58 @@ func deriveMaccKey(arg1, arg2 string) []byte {
 	return h.Sum(nil)
 }
 
-// decryptMaccPayload mirrors decryptMaccPayload@0x140d0f4c0:
-// hex-or-base64 encoded AES-256-CBC/PKCS7 payload. [EVIDENCED]
-func decryptMaccPayload(encoded, password string) (string, error) {
+// decryptMaccPayload mirrors decryptMaccPayload@0x140d0f4c0 plus the
+// multi-candidate key loop of decryptMaccHex (@0x1142860, register-traced):
+//  1. salt-empty guard                                        [EVIDENCED]
+//  2. even length && all hex digits -> hex path, else base64
+//     (bt len,0 + hexdigit scan @0x11426e6)                   [EVIDENCED]
+//  3. candidates = [extractMaccDomain(secondary), secondary],
+//     deduped via memequal (@0x1142980; extractMaccDomain call
+//     @0x1142965 -> 0x11427c0)                                [EVIDENCED]
+//  4. per candidate: deriveMaccKey(candidate, secondary) ->
+//     AES-256-CBC(prefix IV) -> PKCS7; first success wins
+//     (loop @0x1142a65, derive call @0x1142ab5)               [EVIDENCED]
+//
+// secondary = parseMaccServer arg2 = option field @+0xd0,
+// inferred Password                                           [INFERRED]
+func decryptMaccPayload(encoded, secondary string) (string, error) {
 	raw, err := hex.DecodeString(encoded)
-	if err != nil {
+	if err != nil || len(encoded)%2 != 0 || !isHexString(encoded) {
 		raw, err = base64.StdEncoding.DecodeString(encoded)
 		if err != nil {
 			return "", fmt.Errorf("base64 decode error: %w", err)
 		}
 	}
-	return decryptMaccCBC(raw, password)
+	domain := extractMaccDomain(secondary)
+	cands := []string{domain}
+	if domain != secondary {
+		cands = append(cands, secondary)
+	}
+	var lastErr error
+	for _, c := range cands {
+		plain, err := decryptMaccCBC(raw, c, secondary)
+		if err == nil {
+			return plain, nil
+		}
+		lastErr = err
+	}
+	return "", lastErr
 }
 
-func decryptMaccCBC(raw []byte, password string) (string, error) {
+func isHexString(s string) bool {
+	if s == "" {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F')) {
+			return false
+		}
+	}
+	return true
+}
+
+func decryptMaccCBC(raw []byte, candidate, secondary string) (string, error) {
 	if len(raw) == 0 {
 		return "", errors.New("ciphertext too short")
 	}
@@ -327,8 +370,8 @@ func decryptMaccCBC(raw []byte, password string) (string, error) {
 	if len(raw) < 2*aes.BlockSize {
 		return "", errors.New("ciphertext too short")
 	}
-	key := deriveMaccKey(password, "") // [UNKNOWN] arg2
-	// [UNKNOWN] IV policy; prefix-IV assumed (most common scheme).
+	key := deriveMaccKey(candidate, secondary)
+	// IV = first 16 bytes [EVIDENCED: hand-rolled CBC loop, 2-block minimum].
 	block, err := aes.NewCipher(key)
 	if err != nil {
 		return "", fmt.Errorf("create cipher error: %w", err)
@@ -374,13 +417,16 @@ func parseMaccServer(address, password string) (host, port, domain string, err e
 	if !ok || host == "" || port == "" {
 		return "", "", "", fmt.Errorf("invalid decrypted server format: %s (expected host:port)", plain)
 	}
-	return host, port, extractMaccDomain(m[3]), nil
+	return host, port, m[3], nil
 }
 
-// extractMaccDomain mirrors extractMaccDomain@0x140d0f960 (suffix handling).
+// extractMaccDomain mirrors extractMaccDomain@0x11427c0 (MaccCore):
+// strings.Index(s, ".") -> return suffix AFTER first dot; whole string when
+// no dot or dot at position 0. Separator byte 0x2e @0x19eee28, len 1.
+// [EVIDENCED: lea rcx,[rip]#0x19eee28; edi=1; Index; rdx=rax+1; ptr+=rax+1]
 func extractMaccDomain(s string) string {
-	if i := strings.IndexByte(s, ':'); i >= 0 {
-		return s[:i]
+	if i := strings.IndexByte(s, '.'); i > 0 {
+		return s[i+1:]
 	}
 	return s
 }

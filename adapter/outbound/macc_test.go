@@ -13,8 +13,10 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 )
 
-func testEncryptDescriptor(plain, password string, useB64 bool) string {
-	key := deriveMaccKey(password, "")
+func testEncryptDescriptor(plain, secondary string, useB64 bool) string {
+	// key scheme per EVIDENCED candidate loop: no-dot secondary -> single
+	// candidate SHA256(secondary||secondary||salt)
+	key := deriveMaccKey(secondary, secondary)
 	iv := make([]byte, aes.BlockSize)
 	rand.Read(iv)
 	block, _ := aes.NewCipher(key)
@@ -84,5 +86,30 @@ func TestMaccSaltGuard(t *testing.T) {
 	_, err := NewMacc(MaccOption{Address: "a-b-c", Cipher: "dummy"})
 	if err == nil || !strings.Contains(err.Error(), "MaccSalt not set") {
 		t.Fatalf("salt guard: %v", err)
+	}
+}
+
+func TestParseMaccServerDualCandidate(t *testing.T) {
+	C.MaccSalt = "test-salt"
+	secondary := "part.rest.of.pw"
+	// extractMaccDomain = suffix after first dot; first candidate key:
+	// SHA256("rest.of.pw" || secondary || salt)
+	key := deriveMaccKey("rest.of.pw", secondary)
+	iv := make([]byte, 16)
+	copy(iv, []byte("0123456789abcdef"))
+	block, _ := aes.NewCipher(key)
+	plain := []byte("1.2.3.4:9443")
+	pad := 16 - len(plain)%16
+	data := append(append([]byte{}, plain...), bytes.Repeat([]byte{byte(pad)}, pad)...)
+	out := make([]byte, len(iv)+len(data))
+	copy(out, iv)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[16:], data)
+	addr := "pfx-" + hex.EncodeToString(out) + "-host.example.com"
+	host, port, _, err := parseMaccServer(addr, secondary)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host != "1.2.3.4" || port != "9443" {
+		t.Fatalf("dual candidate failed: %s %s", host, port)
 	}
 }
