@@ -1,16 +1,20 @@
 package constant
 
-// MaccSalt is the build-time injected salt for the macc outbound protocol.
+// MaccSalt is the third key-derivation input for the macc server-descriptor
+// cipher: key = SHA256(candidate || protocol-param || MaccSalt).
 //
-// Inject at build time (recommended):
+// It is baked in so macc outbound nodes work out of the box:
 //
-//	go build -ldflags '-X "github.com/metacubex/mihomo/constant.MaccSalt=your-salt"'
+//	var MaccSalt = "N8tY4q1xLk"
 //
-// Evidence: identical mechanism observed in Mielink MaccCore (go1.24) and
-// FlClashCore (go1.26) — error string "MaccSalt not set, please set
-// MIHOMO_MACC_SALT at build time (recommended) or compile with -ldflags ...".
+// It can still be overridden at build time for other deployments:
 //
-// The salt value itself is a per-build secret; it was NOT extracted from any
-// binary during analysis (runtime-only, memory-wiped after reassembly in the
-// Mielink variant).
-var MaccSalt = ""
+//	go build -ldflags '-X "github.com/metacubex/mihomo/constant.MaccSalt=<salt>"'
+//
+// Provenance: recovered from the reference cores (Mielink MaccCore — masked
+// fragments A[perm]^B[perm]; FlClashCore — cleartext in .rdata). It is a
+// protocol-wide constant shared by the whole macc ecosystem, not a per-user
+// secret: it does not reveal node endpoints, which additionally require the
+// encrypted descriptor blobs carried by a subscription (e.g.
+// "doedge-<hex>.sev.cloudfront.net"), and those never appear in this repo.
+var MaccSalt = "N8tY4q1xLk"
