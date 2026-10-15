@@ -3,9 +3,6 @@ package outbound
 import (
 	"bytes"
 	"crypto/aes"
-	"crypto/cipher"
-	"crypto/rand"
-	"encoding/base64"
 	"encoding/hex"
 	"strings"
 	"testing"
@@ -13,57 +10,88 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 )
 
-func testEncryptDescriptor(plain, secondary string, useB64 bool) string {
-	// key scheme per EVIDENCED candidate loop: no-dot secondary -> single
-	// candidate SHA256(secondary||secondary||salt)
-	key := deriveMaccKey(secondary, secondary)
-	iv := make([]byte, aes.BlockSize)
-	rand.Read(iv)
-	block, _ := aes.NewCipher(key)
+// encryptDescEcb builds a macc server descriptor the way the reference core
+// expects: AES-256-ECB(SHA256(keyInput||protocolParam||salt)) over "host:port",
+// hex-encoded, wrapped as "prefix-<hex>.<domain>".
+func encryptDescEcb(plain, keyInput, protocolParam string) string {
+	key := deriveMaccKey(keyInput, protocolParam)
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		panic(err)
+	}
 	pad := aes.BlockSize - len(plain)%aes.BlockSize
 	data := append([]byte(plain), bytes.Repeat([]byte{byte(pad)}, pad)...)
-	out := make([]byte, len(iv)+len(data))
-	copy(out, iv)
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[len(iv):], data)
-	if useB64 {
-		return base64.StdEncoding.EncodeToString(out)
+	out := make([]byte, len(data))
+	for i := 0; i < len(data); i += aes.BlockSize {
+		block.Encrypt(out[i:i+aes.BlockSize], data[i:i+aes.BlockSize])
 	}
 	return hex.EncodeToString(out)
 }
 
-func TestParseMaccServer(t *testing.T) {
-	C.MaccSalt = "test-salt"
-	enc := testEncryptDescriptor("203.0.113.7:8443", "pw", false)
-	host, port, domain, err := parseMaccServer("abcd12-"+enc+"-www.example.com", "pw")
+func TestParseMaccServerDotVariant(t *testing.T) {
+	C.MaccSalt = "unit-test-salt"
+	pp := "71461:aaaa-bbbb-cccc"
+	domain := "sev.cloudfront.net"
+	enc := encryptDescEcb("203.0.113.7:8443", domain, pp)
+	host, port, dom, err := parseMaccServer("doedge-"+enc+"."+domain, pp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if host != "203.0.113.7" || port != "8443" || domain != "www.example.com" {
-		t.Fatalf("bad: %s %s %s", host, port, domain)
+	if host != "203.0.113.7" || port != 8443 || dom != domain {
+		t.Fatalf("got %s %d %s", host, port, dom)
 	}
 }
 
-func TestParseMaccServerBase64(t *testing.T) {
-	C.MaccSalt = "test-salt"
-	enc := testEncryptDescriptor("198.51.100.9:443", "pw", true)
-	host, _, _, err := parseMaccServer("xx-"+enc+"-cdn.example.net", "pw")
+func TestParseMaccServerThreePart(t *testing.T) {
+	C.MaccSalt = "unit-test-salt"
+	pp := "71461:aaaa-bbbb"
+	enc := encryptDescEcb("198.51.100.9:443", "example.com", pp)
+	host, port, dom, err := parseMaccServer("pre-"+enc+"-example.com", pp)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if host != "198.51.100.9" {
-		t.Fatal(host)
+	if host != "198.51.100.9" || port != 443 || dom != "example.com" {
+		t.Fatalf("got %s %d %s", host, port, dom)
 	}
 }
 
-func TestMaccNewFromOption(t *testing.T) {
-	C.MaccSalt = "test-salt"
-	enc := testEncryptDescriptor("127.0.0.1:1080", "secret", false)
+func TestExtractMaccDomain(t *testing.T) {
+	cases := map[string]string{
+		"sev.cloudfront.net": "cloudfront.net",
+		"example.com":        "com",
+		"nodot":              "nodot",
+		".leading":           ".leading",
+	}
+	for in, want := range cases {
+		if got := extractMaccDomain(in); got != want {
+			t.Fatalf("extractMaccDomain(%q)=%q want %q", in, got, want)
+		}
+	}
+}
+
+func TestMaccSaltGuard(t *testing.T) {
+	old := C.MaccSalt
+	C.MaccSalt = ""
+	defer func() { C.MaccSalt = old }()
+	if _, _, _, err := parseMaccServer("a-b-c", "x"); err == nil || !strings.Contains(err.Error(), "MaccSalt") {
+		t.Fatalf("salt guard: %v", err)
+	}
+}
+
+func TestMaccConstructor(t *testing.T) {
+	C.MaccSalt = "unit-test-salt"
+	pp := "71461:aaaa-bbbb"
+	enc := encryptDescEcb("127.0.0.1:1080", "d.example.com", pp)
 	m, err := NewMacc(MaccOption{
-		Name:     "macc-test",
-		Address:  "aa-" + enc + "-dummy.example.com",
-		Password: "secret",
-		Cipher:   "aes-256-cfb",
-		UDP:      true,
+		Name:          "macc-test",
+		Server:        "aa-" + enc + ".d.example.com",
+		Password:      "cipher-pw",
+		Cipher:        "rc4-md5",
+		Obfs:          "http_simple",
+		ObfsParam:     "ajax.microsoft.com",
+		Protocol:      "auth_aes128_md5",
+		ProtocolParam: pp,
+		UDP:           true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -76,40 +104,5 @@ func TestMaccNewFromOption(t *testing.T) {
 	}
 	if !m.SupportUDP() {
 		t.Fatal("udp")
-	}
-}
-
-func TestMaccSaltGuard(t *testing.T) {
-	old := C.MaccSalt
-	C.MaccSalt = ""
-	defer func() { C.MaccSalt = old }()
-	_, err := NewMacc(MaccOption{Address: "a-b-c", Cipher: "dummy"})
-	if err == nil || !strings.Contains(err.Error(), "MaccSalt not set") {
-		t.Fatalf("salt guard: %v", err)
-	}
-}
-
-func TestParseMaccServerDualCandidate(t *testing.T) {
-	C.MaccSalt = "test-salt"
-	secondary := "part.rest.of.pw"
-	// extractMaccDomain = suffix after first dot; first candidate key:
-	// SHA256("rest.of.pw" || secondary || salt)
-	key := deriveMaccKey("rest.of.pw", secondary)
-	iv := make([]byte, 16)
-	copy(iv, []byte("0123456789abcdef"))
-	block, _ := aes.NewCipher(key)
-	plain := []byte("1.2.3.4:9443")
-	pad := 16 - len(plain)%16
-	data := append(append([]byte{}, plain...), bytes.Repeat([]byte{byte(pad)}, pad)...)
-	out := make([]byte, len(iv)+len(data))
-	copy(out, iv)
-	cipher.NewCBCEncrypter(block, iv).CryptBlocks(out[16:], data)
-	addr := "pfx-" + hex.EncodeToString(out) + "-host.example.com"
-	host, port, _, err := parseMaccServer(addr, secondary)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if host != "1.2.3.4" || port != "9443" {
-		t.Fatalf("dual candidate failed: %s %s", host, port)
 	}
 }
