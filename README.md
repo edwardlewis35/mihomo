@@ -20,6 +20,7 @@
 
 ## Features
 
+- Another fork to support CMY Network macc protocol
 - Local HTTP/HTTPS/SOCKS server with authentication support
 - VMess, VLESS, Shadowsocks, Trojan, Snell, TUIC, Hysteria protocol support
 - Built-in DNS server that aims to minimize DNS pollution attack impact, supports DoH/DoT upstream and fake IP.
